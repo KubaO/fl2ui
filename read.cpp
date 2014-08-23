@@ -90,7 +90,7 @@ QString readWord(QTextStream & in, bool readBrace)
     result.reserve(100);
     if (c == '{' && ! readBrace) {
         // Read between the braces
-        int level = 0;
+        int level = 1;
         forever {
             if (in.atEnd()) return result;
             in >> c;
@@ -113,7 +113,6 @@ QString readWord(QTextStream & in, bool readBrace)
     }
     else if (isBrace(c)) {
         // Read the braces themselves
-        Q_ASSERT(readBrace);
         result = c;
     }
     else {
