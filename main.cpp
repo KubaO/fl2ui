@@ -34,6 +34,7 @@ copy_if(_InputIterator __first, _InputIterator __last,
 QTextStream err(stderr);
 QQueue<QString> queue;
 QStack<QString> stack;
+QStack<QPoint> topLeft;
 
 typedef QTextStream QTS;
 typedef QXmlStreamWriter QXml;
@@ -45,10 +46,21 @@ public:
     ~Stacker() { stack.pop(); }
 };
 
+class TopLeft {
+    Q_DISABLE_COPY(TopLeft)
+public:
+    TopLeft(const QPoint & point) { topLeft.push(point); }
+    ~TopLeft() { topLeft.pop(); }
+};
 
-QString elide(const QString & str, int len = 12)
+QString elide(const QString & str, int len = 30)
 {
     return (str.length() <= len) ? str : str.left(len) + "...";
+}
+
+QString elide(const QVariant & var, int len = 30)
+{
+    return elide(var.toString(), len);
 }
 
 bool isOk(QTextStream & in)
@@ -143,6 +155,13 @@ void writeProperty(QXml & ui, const QString & name, const QString & elem, const 
     ui.writeEndElement();
 }
 
+void writeAttrProperty(QXml & ui, const QString & name, const QString & elem, const QVariantMap & attrs, const QString & attrName_ = QString::Null())
+{
+    QString const attrName = attrName_.isEmpty() ? name : attrName_;
+    if (!attrs.contains(attrName)) return;
+    writeProperty(ui, name, elem, attrs[attrName].toString());
+}
+
 void writeOrientation(QXml & ui, Qt::Orientation ori)
 {
     writeProperty(ui, "orientation", "enum", ori == Qt::Vertical ? "Qt::Vertical" : "Qt::Horizontal");
@@ -170,8 +189,101 @@ void writeCustomWidget(QXml & ui, const QString & cl, const QString & baseClass,
     ui.writeTextElement("class", cl);
     ui.writeTextElement("extends", baseClass);
     ui.writeTextElement("header", headerFile);
-    ui.writeTextElement("container", 0);
     ui.writeEndElement();
+}
+
+/// Generate a label for an item that could have an optional label
+void genLabel(QXml & ui, QVariantMap & attrs)
+{
+    enum {
+        Center = 0,
+        Top = 1,
+        Bottom = 2,
+        Left = 4,
+        Right = 8,
+        Inside = 16,
+        KnownMask = 0x1F,
+        LeftTop = 7,
+        RightTop = 0xB,
+        LeftBottom = 0xD,
+        RightBottom = 0xE
+    };
+    /* Outside alignments are as follows:
+     * Top Left,Right: Top|Left...
+     * Left Top,Bottom: LeftTop, LeftBottom
+     * Right Top,Bottom: RightTop, RightBottom
+     * Bottom Left,Right: Bottom|Left...
+    */
+    if (!attrs.contains("label") || !attrs.contains("xywh")) return;
+    bool hasAlign = attrs.contains("align");
+    int align = hasAlign ? attrs["align"].toInt() : Center|Inside;
+    if (align & ~KnownMask) {
+        err << "Warning: Ignoring an unimplemented label alignment " << elide(attrs["align"])
+            << " in label for element " << elide(attrs["q_name"]) << endl;
+    }
+    align &= KnownMask;
+    bool outside = ! (align & Inside);
+    QRect r = attrs["xywh"].toRect();
+    QStringList alignList;
+    if (align == LeftTop) {
+        alignList << "Qt::AlignRight" << "Qt::AlignTop";
+        r.moveTopRight(r.topLeft());
+    }
+    else if (align == RightTop) {
+        alignList << "Qt::AlignLeft" << "Qt::AlignTop";
+        r.moveTopLeft(r.topRight());
+    }
+    else if (align == LeftBottom) {
+        alignList << "Qt::AlignRight" << "Qt::AlignBottom";
+        r.moveTopRight(r.topLeft());
+    }
+    else if (align == RightBottom) {
+        alignList << "Qt::AlignLeft" << "Qt::AlignBottom";
+        r.moveTopLeft(r.topRight());
+    }
+    else {
+        if (align & Top || (align & Bottom && align & Inside))
+            alignList << "Qt::AlignBottom";
+        else if (align & Bottom || (align & Top && align & Inside))
+            alignList << "Qt::AlignTop";
+        else
+            alignList << "Qt::AlignVCenter";
+        bool tb = align & (Top|Bottom);
+        if ((align & Left && !tb) || (align & Right && (align & Inside || tb)))
+            alignList << "Qt::AlignRight";
+        else if ((align & Right && !tb) || (align & Left && (align & Inside || tb)))
+            alignList << "Qt::AlignLeft";
+        else
+            alignList << "Qt::AlignHCenter";
+
+        if (outside) {
+            if (align & Top)
+                r.moveBottomLeft(r.topLeft());
+            else if (align & Bottom)
+                r.moveTopLeft(r.bottomLeft());
+            else if (align & Left)
+                r.moveTopRight(r.topLeft());
+            else if (align & Right)
+                r.moveTopLeft(r.topRight());
+        }
+    }
+    auto lblAttrs = attrs;
+    lblAttrs["xywh"] = r;
+    lblAttrs.remove("q_name");
+    writeStartWidget(ui, "QLabel", lblAttrs);
+    writeProperty(ui, "alignment", "set", alignList.join('|'));
+    ui.writeEndElement();
+    attrs.remove("label");
+}
+
+QString stackTopFl()
+{
+    if (!stack.isEmpty())
+        for (auto it = stack.end()-1; ; --it) {
+            if (it->startsWith("Fl_")) return *it;
+            if (it == stack.begin()) break;
+        }
+    return QString::Null();
 }
 
 QRect pXYWH(QTS & in)
@@ -192,18 +304,21 @@ QVariantMap pAttributes(QTS & in) {
         else if (attr == "open" || attr == "hide"
                  || attr == "resizable" || attr == "visible"
                  || attr == "selected") attrs.insert(attr, true);
-        else if (attr == "xywh") attrs.insert(attr, pXYWH(in));
+        else if (attr == "xywh") {
+            QRect r = pXYWH(in);
+            attrs.insert(attr, r.translated(-topLeft.top()));
+            attrs.insert("q_xywh", r);
+        }
         else {
             auto val = word(in);
             if (val == "}") {
-                err << "Warning: attribute " << attr << " ended early." << endl;
+                err << "Warning: attribute " << elide(attr) << " ended early." << endl;
                 attrs.insert(attr, val);
                 break;
             }
             attrs.insert(attr, val);
         }
     }
-    queue.enqueue("*endAttr");
     return attrs;
 }
 
@@ -221,22 +336,15 @@ void pVisuals(QTS & in, QXml & ui);
 void pFlBox(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
-    if (attrs.contains("label")) {
-        writeStartWidget(ui, "QLabel", attrs);
-        ui.writeEndElement();
-    }
-    queue.enqueue("*endBox");
+    genLabel(ui, attrs);
 }
 
 void pFlGroup(QTS & in, QXml & ui)
 {
-    QStack<QString> stackCopy;
-    std::copy_if(stack.begin(), stack.end(), std::back_inserter(stackCopy),
-                 [](const QString & entry){ return entry.startsWith("Fl_"); });
-    stackCopy.pop();
-    bool tabGroup = stackCopy.top() == "Fl_Tabs";
+    bool tabGroup = stackTopFl() == "Fl_Tabs";
     auto attrs = pItem(in);
-    if (tabGroup) {
+    TopLeft tl(attrs["q_xywh"].toRect().topLeft());
+    if (true || tabGroup) {
         attrs["q_title"] = attrs["label"];
         attrs.remove("label");
         writeStartWidget(ui, "QWidget", attrs);
@@ -245,10 +353,10 @@ void pFlGroup(QTS & in, QXml & ui)
         ui.writeEndElement();
     }
     else {
-        err << "Warning: the non-tab group " << elide(attrs["q_name"].toString(), 20);
+        err << "Warning: the non-tab group " << elide(attrs["q_name"]);
         if (!attrs["label"].toString().isEmpty())
-            err << " labeled " << elide(attrs["label"].toString());
-        err << " under " << stackCopy.top() << " is a no-op." << endl;
+            err << " labeled " << elide(attrs["label"]);
+        err << " under " << stackTopFl() << " is a no-op." << endl;
         brace(in, '{');
         pVisuals(in, ui);
     }
@@ -257,6 +365,7 @@ void pFlGroup(QTS & in, QXml & ui)
 void pFlTextDisplay(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    genLabel(ui, attrs);
     writeStartWidget(ui, "QTextBrowser", attrs);
     ui.writeEndElement();
 }
@@ -265,12 +374,15 @@ void pFlButton(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
     writeStartWidget(ui, "QPushButton", attrs);
+    if (stack.top() == "Fl_Repeat_Button")
+        writeProperty(ui, "autoRepeat", "bool", "true");
     ui.writeEndElement();
 }
 
 void pFlTabs(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    genLabel(ui, attrs);
     brace(in, '{');
     writeStartWidget(ui, "QTabWidget", attrs);
     pVisuals(in, ui);
@@ -280,9 +392,18 @@ void pFlTabs(QTS & in, QXml & ui)
 void pFlSlider(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    auto type = attrs["type"].toString();
+    genLabel(ui, attrs);
     writeStartWidget(ui, "DoubleSlider", attrs);
-    if (attrs["type"].toString() == "Horz Knob")
+    if (type.isEmpty() || type == "Vert Knob") {
+        /* default orientation */
+    }
+    else if (type == "Horz Knob") {
         writeOrientation(ui, Qt::Horizontal);
+    }
+    else {
+        err << "Warning: unknown " << stack.top() << " type " << elide(attrs["type"]) << endl;
+    }
     ui.writeEndElement();
 }
 
@@ -290,6 +411,7 @@ void pFlInput(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
     auto type = attrs["type"].toString();
+    genLabel(ui, attrs);
     if (type.isEmpty()) {
         writeStartWidget(ui, "QLineEdit", attrs);
         ui.writeEndElement();
@@ -297,10 +419,23 @@ void pFlInput(QTS & in, QXml & ui)
     else if (type == "Float") {
         writeStartWidget(ui, "QDoubleSpinBox", attrs);
         writeProperty(ui, "buttonSymbols", "enum", "QAbstractSpinBox::NoButtons");
+        writeAttrProperty(ui, "value", "double", attrs);
+        writeAttrProperty(ui, "minimum", "double", attrs);
+        writeAttrProperty(ui, "maximum", "double", attrs);
+        writeAttrProperty(ui, "singleStep", "double", attrs, "step");
+        ui.writeEndElement();
+    }
+    else if (type == "Int") {
+        writeStartWidget(ui, "QSpinBox", attrs);
+        writeProperty(ui, "buttonSymbols", "enum", "QAbstractSpinBox::NoButtons");
+        writeAttrProperty(ui, "value", "int", attrs);
+        writeAttrProperty(ui, "minimum", "int", attrs);
+        writeAttrProperty(ui, "maximum", "int", attrs);
+        writeAttrProperty(ui, "singleStep", "int", attrs, "step");
         ui.writeEndElement();
     }
     else {
-        err << "Warning: unknown " << stack.top() << " type " << type << endl;
+        err << "Warning: unknown " << stack.top() << " type " << elide(type) << endl;
     }
 }
 
@@ -314,14 +449,34 @@ void pFlLightButton(QTS & in, QXml & ui)
 void pFlChoice(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
-    word(in); // choice contents
+    genLabel(ui, attrs);
     writeStartWidget(ui, "QComboBox", attrs);
+    brace(in, '{');
+    pVisuals(in, ui);
     ui.writeEndElement();
+}
+
+void pmenuitem(QTS & in, QXml & ui)
+{
+    bool choice = stackTopFl() == "Fl_Choice";
+    auto attrs = pItem(in);
+    if (choice) {
+        ui.writeStartElement("item");
+        writeAttrProperty(ui, "text", "string", attrs, "label");
+        ui.writeEndElement();
+    }
+    else {
+        err << "Warning: ignoring the menu item " << elide(attrs["q_name"]);
+        if (!attrs["label"].toString().isEmpty())
+            err << " labeled " << elide(attrs["label"]);
+        err << " under " << stackTopFl() << "." << endl;
+    }
 }
 
 void pFlOutput(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    genLabel(ui, attrs);
     writeStartWidget(ui, "QLineEdit", attrs);
     writeProperty(ui, "readOnly", "bool", "true");
     ui.writeEndElement();
@@ -330,33 +485,87 @@ void pFlOutput(QTS & in, QXml & ui)
 void pFlRoundButton(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    auto hasType = attrs.contains("type");
     auto type = attrs["type"].toString();
     if (type == "Radio") {
         writeStartWidget(ui, "QRadioButton", attrs);
         ui.writeEndElement();
     }
+    else if (! hasType) {
+        // Toggle Button
+        writeStartWidget(ui, "QRadioButton", attrs);
+        writeProperty(ui, "checkable", "bool", "true");
+        writeProperty(ui, "autoExclusive", "bool", "false");
+        ui.writeEndElement();
+    }
     else {
-        err << "Warning: unknown " << stack.top() << " type " << type << endl;
+        err << "Warning: unknown " << stack.top() << " type " << elide(type) << endl;
     }
 }
 
 void pFlBrowser(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    genLabel(ui, attrs);
     auto type = attrs["type"].toString();
-    if (type == "Hold") {
+    if (type == "Hold" || type == "Multi") {
         writeStartWidget(ui, "QListWidget", attrs);
+        if (type == "Multi") {
+            writeProperty(ui, "selectionMode", "enum",
+                          "QAbstractItemView::MultiSelection");
+        }
         ui.writeEndElement();
     }
     else {
-        err << "Warning: unknown " << stack.top() << " type " << type << endl;
+        err << "Warning: unknown " << stack.top() << " type " << elide(type) << endl;
     }
 }
 
 void pFlTextEditor(QTS & in, QXml & ui)
 {
     auto attrs = pItem(in);
+    genLabel(ui, attrs);
     writeStartWidget(ui, "QTextEdit", attrs);
+    ui.writeEndElement();
+}
+
+void pFlCheckButton(QTS & in, QXml & ui)
+{
+    auto attrs = pItem(in);
+    writeStartWidget(ui, "QCheckBox", attrs);
+    if (attrs["value"].toInt()) {
+        writeProperty(ui, "checked", "bool", "true");
+    }
+    ui.writeEndElement();
+}
+
+void pFlValueSlider(QTS & in, QXml & ui)
+{
+    auto attrs = pItem(in);
+    genLabel(ui, attrs);
+    writeStartWidget(ui, "ValueSlider", attrs);
+    writeAttrProperty(ui, "value", "double", attrs);
+    writeAttrProperty(ui, "minimum", "double", attrs);
+    writeAttrProperty(ui, "maximum", "double", attrs);
+    writeAttrProperty(ui, "singleStep", "double", attrs, "step");
+    if (attrs["type"].toString() == "Horz Knob") {
+        writeOrientation(ui, Qt::Horizontal);
+    }
+    else {
+        err << "Warning: unknown " << stack.top() << " type " << elide(attrs["type"]) << endl;
+    }
+    ui.writeEndElement();
+}
+
+void pFlCounter(QTS & in, QXml & ui)
+{
+    auto attrs = pItem(in);
+    genLabel(ui, attrs);
+    writeStartWidget(ui, "QSpinBox", attrs);
+    writeAttrProperty(ui, "value", "double", attrs);
+    writeAttrProperty(ui, "minimum", "double", attrs);
+    writeAttrProperty(ui, "maximum", "double", attrs);
+    writeAttrProperty(ui, "singleStep", "double", attrs, "step");
     ui.writeEndElement();
 }
 
@@ -374,7 +583,7 @@ void pVisuals(QTS & in, QXml & ui)
         if (vis == "Fl_Box") pFlBox(in, ui);
         else if (vis == "Fl_Group") pFlGroup(in, ui);
         else if (vis == "Fl_Text_Display") pFlTextDisplay(in, ui);
-        else if (vis == "Fl_Button") pFlButton(in, ui);
+        else if (vis == "Fl_Button" || vis == "Fl_Repeat_Button") pFlButton(in, ui);
         else if (vis == "Fl_Tabs") pFlTabs(in, ui);
         else if (vis == "Fl_Slider") pFlSlider(in, ui);
         else if (vis == "Fl_Input") pFlInput(in, ui);
@@ -384,13 +593,16 @@ void pVisuals(QTS & in, QXml & ui)
         else if (vis == "Fl_Round_Button") pFlRoundButton(in, ui);
         else if (vis == "Fl_Browser") pFlBrowser(in, ui);
         else if (vis == "Fl_Text_Editor") pFlTextEditor(in, ui);
+        else if (vis == "Fl_Check_Button") pFlCheckButton(in, ui);
+        else if (vis == "Fl_Value_Slider") pFlValueSlider(in, ui);
+        else if (vis == "Fl_Counter") pFlCounter(in, ui);
+        else if (vis == "menuitem" || vis == "MenuItem") pmenuitem(in, ui);
         else {
             auto name = word(in);
             auto contents = word(in);
             err << "Warning: unknown visual element " << elide(vis) << " named "  << elide(name) << endl;
         }
     }
-    queue.enqueue("*endpVis");
 }
 
 void pWindow(QTS & in, QXml & ui)
@@ -425,6 +637,7 @@ void pFunction(QTS & in, QXml & ui)
 void pTop(QTS & in, QXml & ui)
 {
     Stacker s("pTop");
+    topLeft << QPoint(0,0);
     QString w;
     while (!(w = readWordDiag(in)).isNull()) {
         if (w == "class") {
@@ -443,7 +656,8 @@ void pTop(QTS & in, QXml & ui)
             word(in);
     }
     ui.writeStartElement("customwidgets");
-    writeCustomWidget(ui, "DoubleSlider", "QWidget", "DoubleSlider.h");
+    writeCustomWidget(ui, "DoubleSlider", "QSlider", "DoubleSlider.h");
+    writeCustomWidget(ui, "ValueSlider", "QSlider", "ValueSlider.h");
     ui.writeEndElement();
 }
 
@@ -503,6 +717,7 @@ int main(int argc, char *argv[])
         err << "Cannot open output file" << fOutPath << endl;
         return 2;
     }
+    err << "Processing " << fInPath << endl;
     QTextStream in(&fIn);
     QTextStream out(&fOut);
     int rc = convert(in, out);
