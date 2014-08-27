@@ -8,6 +8,7 @@
 #include <QRect>
 #include <QQueue>
 #include <QStack>
+#include <QSet>
 #include <QDebug>
 #include <algorithm>
 #include <cstdio>
@@ -31,13 +32,15 @@ copy_if(_InputIterator __first, _InputIterator __last,
 } }
 #endif
 
+typedef QTextStream QTS;
+typedef QXmlStreamWriter QXml;
+
 QTextStream err(stderr);
 QQueue<QString> queue;
 QStack<QString> stack;
 QStack<QPoint> topLeft;
-
-typedef QTextStream QTS;
-typedef QXmlStreamWriter QXml;
+QMap<QString, int> objectNameCounter;
+QSet<QString> objectNames;
 
 class Stacker {
     Q_DISABLE_COPY(Stacker)
@@ -52,6 +55,25 @@ public:
     TopLeft(const QPoint & point) { topLeft.push(point); }
     ~TopLeft() { topLeft.pop(); }
 };
+
+/// Find a unique name for an object of given class
+QString objectName(QString const & class_, QString name = QString::Null())
+{
+    QString stem = name;
+    if (stem.isEmpty()) {
+        stem = class_.startsWith('Q') ? class_.mid(1) : class_;
+        stem[0] = stem[0].toLower();
+        name = stem;
+    }
+    while (objectNames.contains(name)) {
+        if (! objectNameCounter.contains(stem)) {
+            objectNameCounter[stem] = 2;
+        }
+        name = QString("%1_%2").arg(stem).arg(objectNameCounter[stem]++);
+    }
+    objectNames.insert(name);
+    return name;
+}
 
 QString elide(const QString & str, int len = 30)
 {
@@ -167,14 +189,14 @@ void writeOrientation(QXml & ui, Qt::Orientation ori)
     writeProperty(ui, "orientation", "enum", ori == Qt::Vertical ? "Qt::Vertical" : "Qt::Horizontal");
 }
 
-void writeStartWidget(QXml & ui, const QString & cl, const QVariantMap & attrs)
+void writeStartWidget(QXml & ui, const QString & class_, const QVariantMap & attrs)
 {
     ui.writeStartElement("widget");
-    ui.writeAttribute("class", cl);
-    if (attrs.contains("q_name")) {
-        auto name = attrs["q_name"].toString();
-        if (! name.isEmpty()) ui.writeAttribute("name", name);
-    }
+    ui.writeAttribute("class", class_);
+    QString name;
+    if (attrs.contains("q_name")) name = attrs["q_name"].toString();
+    name = objectName(class_, name);
+    ui.writeAttribute("name", name);
     if (attrs.contains("xywh"))
         writeGeometry(ui, attrs["xywh"].toRect());
     if (attrs.contains("label"))
@@ -647,7 +669,7 @@ void pTop(QTS & in, QXml & ui)
             ui.writeTextElement("class", name);
             ui.writeStartElement("widget");
             ui.writeAttribute("class", "QDialog");
-            ui.writeAttribute("name", name);
+            ui.writeAttribute("name", objectName("QDialog", name));
             brace(in, '{');
             pFunction(in, ui);
             ui.writeEndElement();
@@ -688,6 +710,7 @@ int convert(QTextStream & inRaw, QTextStream & out)
         err << "Error writing the output" << endl;
         return 4;
     }
+    out.flush();
     return 0;
 }
 
@@ -721,7 +744,6 @@ int main(int argc, char *argv[])
     QTextStream in(&fIn);
     QTextStream out(&fOut);
     int rc = convert(in, out);
-    out.flush();
     if (!fOut.commit()) {
         err << "Cannot finish output file" << fOutPath << endl;
         return 3;
